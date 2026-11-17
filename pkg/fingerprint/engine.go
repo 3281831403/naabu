@@ -14,6 +14,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Mzack9999/gcache"
 	"github.com/projectdiscovery/naabu/v2/pkg/port"
 )
 
@@ -29,7 +30,14 @@ type Engine struct {
 	fastMode       bool
 	dialer         DialFunc
 	intensityMax   int
-	matchCache     sync.Map // response hash → *matchCacheEntry (avoids re-matching identical banners)
+	matchCacheSize int
+	// matchCache maps response hash → match outcome, avoiding re-matching
+	// identical banners. It is a bounded LRU: long scans against hosts with
+	// unique banners (timestamps, tokens, per-host greetings) used to grow
+	// this cache without limit until the OOM killer stepped in. The cache is
+	// per-engine, so SDK callers running consecutive scans never see results
+	// from a previous run.
+	matchCache gcache.Cache[uint64, *matchCacheEntry]
 }
 
 // StreamResult is emitted by FingerprintStream for each completed target. Service is nil when no probe matched.
@@ -52,12 +60,16 @@ func New(db *ProbeDB, opts ...Option) *Engine {
 		connectTimeout: DefaultConnectTimeout,
 		dialer:         defaultDialer,
 		intensityMax:   7,
+		matchCacheSize: DefaultMatchCacheSize,
 	}
 	for _, o := range opts {
 		o(e)
 	}
 	if e.connectTimeout > e.timeout {
 		e.connectTimeout = e.timeout
+	}
+	if e.matchCacheSize > 0 {
+		e.matchCache = gcache.New[uint64, *matchCacheEntry](e.matchCacheSize).LRU().Build()
 	}
 	return e
 }
@@ -594,7 +606,10 @@ func isConnectionClosed(err error) bool {
 
 // tryMatches runs response against a list of match directives.
 // Three layers of optimization avoid running the regex engine unnecessarily:
-//  1. Response cache: identical banners (by hash) return cached results instantly
+//  1. Response cache: identical banners (by hash) return cached results instantly.
+//     The cache is a bounded LRU, so long scans keep a fixed memory ceiling;
+//     a lookup never triggers network I/O, so a cache hit early-exit sends no
+//     extra probe packets.
 //  2. Latin-1 conversion: done once and shared across all 3,997+ pattern checks
 //  3. Literal prefix filter: patterns whose prefix doesn't appear in the response
 //     are skipped without invoking the regex engine at all
@@ -604,8 +619,10 @@ func (e *Engine) tryMatches(matches []*Match, response []byte) *MatchResult {
 	}
 
 	cacheKey := responseHash(matches, response)
-	if cached, ok := e.matchCache.Load(cacheKey); ok {
-		return cached.(*matchCacheEntry).result
+	if e.matchCache != nil {
+		if cached, err := e.matchCache.Get(cacheKey); err == nil {
+			return cached.result
+		}
 	}
 
 	latin1 := bytesToLatin1(response)
@@ -628,7 +645,9 @@ func (e *Engine) tryMatches(matches []*Match, response []byte) *MatchResult {
 		break
 	}
 
-	e.matchCache.Store(cacheKey, &matchCacheEntry{result: result})
+	if e.matchCache != nil {
+		_ = e.matchCache.Set(cacheKey, &matchCacheEntry{result: result})
+	}
 	return result
 }
 

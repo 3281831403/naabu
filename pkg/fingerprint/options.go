@@ -6,6 +6,10 @@ const (
 	DefaultWorkers        = 25
 	DefaultTimeout        = 5 * time.Second
 	DefaultConnectTimeout = 3 * time.Second
+	// DefaultMatchCacheSize bounds the response-match LRU. Entries are small
+	// (a hash key plus a match outcome pointer), so this caps the cache at a
+	// few MB regardless of how many distinct banners a scan encounters.
+	DefaultMatchCacheSize = 32768
 )
 
 // Option configures the Engine.
@@ -46,5 +50,15 @@ func WithIntensity(level int) Option {
 		if level >= 1 && level <= 9 {
 			e.intensityMax = level
 		}
+	}
+}
+
+// WithMatchCacheSize sets the maximum number of cached response-match
+// outcomes. Identical banners still hit the cache; once the bound is reached
+// the least-recently-used entries are evicted. A non-positive value disables
+// caching.
+func WithMatchCacheSize(n int) Option {
+	return func(e *Engine) {
+		e.matchCacheSize = n
 	}
 }

@@ -1227,6 +1227,52 @@ func (r *Runner) ConnectVerification() {
 	swg.Wait()
 
 	r.scanner.ScanResults = verifiedResult
+
+	// In -sV mode the scan-time results were dropped before reaching the
+	// fingerprint queue (they were still unverified), so nothing has been
+	// fingerprinted yet. Feed the verified ports into service detection now;
+	// waitServiceDetection drains the queue and merges the services into this
+	// verified result set before any output (terminal, JSON/CSV, XML, gnmap)
+	// is produced from it.
+	if r.options.ServiceVersion {
+		r.queueVerifiedFingerprints(verifiedResult)
+	}
+}
+
+// queueVerifiedFingerprints enqueues verified TCP ports for service
+// fingerprinting, mirroring the enqueue logic onReceive uses during the scan.
+// It is a no-op when the fingerprint pipeline is not running.
+func (r *Runner) queueVerifiedFingerprints(verified *result.Result) {
+	r.fpMu.Lock()
+	fpq := r.fpQueue
+	r.fpMu.Unlock()
+	if fpq == nil {
+		return
+	}
+	tlsChecked := !r.options.Passive && !r.options.shouldUseRawPackets()
+	for hostResult := range verified.GetIPsPorts() {
+		hostname := hostResult.IP
+		if dt, err := r.hostsForIP(hostResult.IP); err == nil {
+			for _, h := range dt {
+				if h != "ip" && h != hostResult.IP {
+					hostname = h
+					break
+				}
+			}
+		}
+		for _, p := range hostResult.Ports {
+			if p.Protocol != protocol.TCP {
+				continue
+			}
+			fpq.push(fingerprint.Target{
+				Host:        hostname,
+				IP:          hostResult.IP,
+				Port:        p.Port,
+				TLSDetected: p.TLS, //nolint:staticcheck // deprecated but still set by scan layer
+				TLSChecked:  tlsChecked,
+			})
+		}
+	}
 }
 
 func (r *Runner) BackgroundWorkers(ctx context.Context) {
